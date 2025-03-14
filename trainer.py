@@ -1,6 +1,8 @@
 import os
 import glob
 import time
+import random
+import contextlib
 import torch
 import torch.nn.functional as F
 from torch.utils.data import IterableDataset, DataLoader
@@ -10,28 +12,47 @@ import psutil
 import seaborn as sns
 from sklearn.metrics import confusion_matrix, roc_auc_score, roc_curve, classification_report
 from tqdm import tqdm
-import contextlib
+
+import logging
+logging.basicConfig(level=logging.INFO)
 
 # ---------------------------
-# Eksempel: Streaming-datasett for LorentzNet
+# Streaming-datasett for LorentzNet
 # ---------------------------
 class StreamingLorentzDataset(IterableDataset):
     """
-    Iterer over alle shard-filer (f.eks. "shard_0.pt", "shard_1.pt", ...)
-    Hver shard inneholder en liste med (label, p4s, nodes, atom_mask).
+    Iterer over en liste med shard-filer.
+    Hver shard er en .pt-fil som inneholder en liste med (label, p4s, nodes, atom_mask).
+    Under iterasjon stokkes rekkefølgen på shardene og sample-listen i hver shard.
     """
-    def __init__(self, shards_dir, pattern="shard_*.pt"):
+    def __init__(self, shard_files):
         super().__init__()
-        self.shard_files = sorted(glob.glob(os.path.join(shards_dir, pattern)))
+        self.shard_files = sorted(shard_files)
         if not self.shard_files:
-            raise RuntimeError(f"Ingen shard-filer funnet i {shards_dir} med mønster {pattern}")
+            raise RuntimeError("Ingen shard-filer funnet!")
 
     def __iter__(self):
-        for shard in self.shard_files:
-            # Last inn én shard om gangen – spesifiser weights_only=False for å laste hele objektet
+        shards = self.shard_files.copy()
+        random.shuffle(shards)
+        for shard in shards:
             samples = torch.load(shard, weights_only=False)
+            random.shuffle(samples)
             for sample in samples:
                 yield sample
+
+# ---------------------------
+# Funksjon for å splitte shard-filer
+# ---------------------------
+def split_shards(shards_dir, pattern="shard_*.pt", train_frac=0.8, val_frac=0.1):
+    shard_files = sorted(glob.glob(os.path.join(shards_dir, pattern)))
+    n = len(shard_files)
+    n_train = int(train_frac * n)
+    n_val = int(val_frac * n)
+    train_shards = shard_files[:n_train]
+    val_shards = shard_files[n_train:n_train+n_val]
+    test_shards = shard_files[n_train+n_val:]
+    logging.info(f"Splitter {n} shards til: {len(train_shards)} trenings-, {len(val_shards)} validerings-, {len(test_shards)} test-shards.")
+    return train_shards, val_shards, test_shards
 
 # ---------------------------
 # Collate-funksjon
@@ -65,12 +86,12 @@ def collate_fn(data):
     return labels, p4s, nodes, atom_masks, edge_mask, edges
 
 # ---------------------------
-# Modell-definisjoner (LorentzNet, LGEB, osv.)
+# Modell-definisjoner
 # ---------------------------
 import torch.nn as nn
 
 def unsorted_segment_sum(data, segment_ids, num_segments):
-    segment_ids = segment_ids.to(data.device)  # Sikre at segment_ids er på samme enhet
+    segment_ids = segment_ids.to(data.device)
     result = data.new_zeros((num_segments, data.size(1)))
     result.index_add_(0, segment_ids, data)
     return result
@@ -100,7 +121,6 @@ class LGEB(nn.Module):
         super(LGEB, self).__init__()
         self.c_weight = c_weight
         n_edge_attr = 2
-
         self.phi_e = nn.Sequential(
             nn.Linear(n_input * 2 + n_edge_attr, n_hidden, bias=False),
             nn.BatchNorm1d(n_hidden),
@@ -208,21 +228,18 @@ class LorentzNet(nn.Module):
 # ---------------------------
 class Args:
     def __init__(self):
-        # Modellparametere for LorentzNet
-        self.n_scalar = 2      # For eksempel invariant masse og ladning
+        self.n_scalar = 2      # f.eks. invariant masse og ladning
         self.n_hidden = 64
-        self.n_class = 10      # Antall klasser
+        self.n_class = 10      # antall klasser
         self.n_layers = 6
         self.c_weight = 1e-3
         self.dropout = 0.0
 
-        # Treningsparametere
         self.epochs = 10
         self.batch_size = 128
         self.learning_rate = 1e-3
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
 
-        # Mappen der shard-filene ligger
         self.shards_dir = "./processed_dataset/shards"
 
 args = Args()
@@ -235,29 +252,42 @@ if __name__ == '__main__':
     mp.set_start_method('fork', force=True)
 
     DEVICE = torch.device(args.device)
-    # Kjør alltid i full presisjon (float32)
+    # Full presisjon: float32
     if DEVICE.type == "cuda":
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.benchmark = True
-    # Ingen GradScaler siden vi ikke bruker AMP
+    # Ingen GradScaler siden vi bruker full presisjon
     scaler = None
 
-    # Bruk streaming-datasettet
-    stream_dataset = StreamingLorentzDataset(args.shards_dir)
-    num_shards = len(glob.glob(os.path.join(args.shards_dir, 'shard_*.pt')))
-    print(f"Streaming-datasettet inneholder {num_shards} shards.")
+    # Splitte shard-filene i separate sett for trening, validering og testing:
+    def split_shards(shards_dir, pattern="shard_*.pt", train_frac=0.8, val_frac=0.1):
+        shard_files = sorted(glob.glob(os.path.join(shards_dir, pattern)))
+        n = len(shard_files)
+        n_train = int(train_frac * n)
+        n_val = int(val_frac * n)
+        train_shards = shard_files[:n_train]
+        val_shards = shard_files[n_train:n_train+n_val]
+        test_shards = shard_files[n_train+n_val:]
+        logging.info(f"Splitter {n} shards til: {len(train_shards)} trenings-, {len(val_shards)} validerings-, {len(test_shards)} test-shards.")
+        return train_shards, val_shards, test_shards
 
-    train_loader = DataLoader(stream_dataset, batch_size=args.batch_size, num_workers=4, collate_fn=collate_fn, pin_memory=True)
-    val_loader   = DataLoader(stream_dataset, batch_size=args.batch_size, num_workers=4, collate_fn=collate_fn, pin_memory=True)
-    test_loader  = DataLoader(stream_dataset, batch_size=args.batch_size, num_workers=4, collate_fn=collate_fn, pin_memory=True)
+    train_shards, val_shards, test_shards = split_shards(args.shards_dir)
+
+    train_dataset = StreamingLorentzDataset(train_shards)
+    val_dataset = StreamingLorentzDataset(val_shards)
+    test_dataset = StreamingLorentzDataset(test_shards)
+
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, num_workers=4, collate_fn=collate_fn, pin_memory=True)
+    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, num_workers=4, collate_fn=collate_fn, pin_memory=True)
+    test_loader = DataLoader(test_dataset, batch_size=args.batch_size, num_workers=4, collate_fn=collate_fn, pin_memory=True)
 
     model = LorentzNet(n_scalar=args.n_scalar, n_hidden=args.n_hidden, n_class=args.n_class,
                        n_layers=args.n_layers, c_weight=args.c_weight, dropout=args.dropout).to(DEVICE)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate)
 
     TRAIN_BATCHES_TOTAL = 12500
-    VAL_BATCHES_TOTAL   = 1562
-    TEST_BATCHES_TOTAL  = 1562
+    VAL_BATCHES_TOTAL = 1562
+    TEST_BATCHES_TOTAL = 1562
 
     def train_epoch(model, optimizer, loader, epoch):
         model.train()
@@ -270,7 +300,7 @@ if __name__ == '__main__':
             nodes = nodes.to(DEVICE).to(torch.float32)
             atom_mask = atom_mask.to(DEVICE)
             edge_mask = edge_mask.to(DEVICE)
-            scalars = nodes.mean(dim=1)  # Full presisjon
+            scalars = nodes.mean(dim=1)
             n_nodes = p4s.shape[1]
             optimizer.zero_grad()
             outputs = model(scalars, p4s, edges, atom_mask, edge_mask, n_nodes)
@@ -284,7 +314,7 @@ if __name__ == '__main__':
             total_correct += (outputs.argmax(dim=1) == targets).sum().item()
             total_samples += bs
             cur_loss = total_loss / total_samples
-            cur_acc  = total_correct / total_samples
+            cur_acc = total_correct / total_samples
             pbar.set_postfix(loss=f"{cur_loss:.4f}", acc=f"{cur_acc:.4f}")
             if i + 1 >= TRAIN_BATCHES_TOTAL:
                 break
@@ -312,14 +342,14 @@ if __name__ == '__main__':
                 preds = out.argmax(dim=1)
                 probs = torch.softmax(out, dim=1)[:, 1].cpu().numpy()
                 bs = targets.size(0)
-                total_loss    += loss.item() * bs
+                total_loss += loss.item() * bs
                 total_correct += (preds == targets).sum().item()
                 total_samples += bs
                 all_preds.extend(preds.cpu().numpy())
                 all_labels.extend(targets.cpu().numpy())
                 all_probs.extend(probs)
                 cur_loss = total_loss / total_samples
-                cur_acc  = total_correct / total_samples
+                cur_acc = total_correct / total_samples
                 pbar.set_postfix(loss=f"{cur_loss:.4f}", acc=f"{cur_acc:.4f}")
                 if i + 1 >= total_steps:
                     break
@@ -425,6 +455,7 @@ if __name__ == '__main__':
             all_preds.extend(preds.cpu().numpy())
             all_labels.extend(labels.cpu().numpy())
 
+    from sklearn.metrics import confusion_matrix
     cm = confusion_matrix(all_labels, all_preds)
     plt.figure(figsize=(6, 5))
     sns.heatmap(cm, annot=True, fmt="d", cmap="Blues")
@@ -434,6 +465,7 @@ if __name__ == '__main__':
     plt.savefig("confusion_matrix_lorentznet.png")
     plt.show()
 
+    from sklearn.metrics import classification_report
     print("📊 Klassifikasjonsrapport:")
     print(classification_report(all_labels, all_preds, digits=4))
 
