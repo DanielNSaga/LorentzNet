@@ -17,7 +17,7 @@ import contextlib
 # ---------------------------
 class StreamingLorentzDataset(IterableDataset):
     """
-    Iterer over alle shard-filer (for eksempel lagret som "shard_0.pt", "shard_1.pt", ...)
+    Iterer over alle shard-filer (f.eks. "shard_0.pt", "shard_1.pt", ...)
     Hver shard inneholder en liste med (label, p4s, nodes, atom_mask).
     """
     def __init__(self, shards_dir, pattern="shard_*.pt"):
@@ -62,7 +62,6 @@ def collate_fn(data):
     rows = np.concatenate(rows)
     cols = np.concatenate(cols)
     edges = [torch.LongTensor(rows), torch.LongTensor(cols)]
-
     return labels, p4s, nodes, atom_masks, edge_mask, edges
 
 # ---------------------------
@@ -71,11 +70,13 @@ def collate_fn(data):
 import torch.nn as nn
 
 def unsorted_segment_sum(data, segment_ids, num_segments):
+    segment_ids = segment_ids.to(data.device)  # Sikre at segment_ids er på samme enhet
     result = data.new_zeros((num_segments, data.size(1)))
     result.index_add_(0, segment_ids, data)
     return result
 
 def unsorted_segment_mean(data, segment_ids, num_segments):
+    segment_ids = segment_ids.to(data.device)
     result = data.new_zeros((num_segments, data.size(1)))
     count = data.new_zeros((num_segments, data.size(1)))
     result.index_add_(0, segment_ids, data)
@@ -234,20 +235,12 @@ if __name__ == '__main__':
     mp.set_start_method('fork', force=True)
 
     DEVICE = torch.device(args.device)
+    # Kjør alltid i full presisjon (float32)
     if DEVICE.type == "cuda":
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.benchmark = True
-        scaler = torch.cuda.amp.GradScaler()
-    else:
-        # Dummy scaler for CPU
-        class DummyScaler:
-            def scale(self, loss):
-                return loss
-            def step(self, optimizer):
-                optimizer.step()
-            def update(self):
-                pass
-        scaler = DummyScaler()
+    # Ingen GradScaler siden vi ikke bruker AMP
+    scaler = None
 
     # Bruk streaming-datasettet
     stream_dataset = StreamingLorentzDataset(args.shards_dir)
@@ -273,25 +266,18 @@ if __name__ == '__main__':
         for i, batch in enumerate(pbar):
             labels, p4s, nodes, atom_mask, edge_mask, edges = batch
             labels = labels.to(DEVICE)
-            p4s = p4s.to(DEVICE)
-            nodes = nodes.to(DEVICE)
+            p4s = p4s.to(DEVICE).to(torch.float32)
+            nodes = nodes.to(DEVICE).to(torch.float32)
             atom_mask = atom_mask.to(DEVICE)
             edge_mask = edge_mask.to(DEVICE)
-            scalars = nodes.mean(dim=1)
+            scalars = nodes.mean(dim=1)  # Full presisjon
             n_nodes = p4s.shape[1]
-            # Cast p4s til fp16 kun på CUDA
-            if DEVICE.type == "cuda":
-                p4s = p4s.to(torch.float16)
-            else:
-                p4s = p4s.to(torch.float32)
             optimizer.zero_grad()
-            with (torch.amp.autocast(device_type="cuda") if DEVICE.type=="cuda" else contextlib.nullcontext()):
-                outputs = model(scalars, p4s, edges, atom_mask, edge_mask, n_nodes)
-                targets = labels.long()
-                loss = F.cross_entropy(outputs, targets)
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
+            outputs = model(scalars, p4s, edges, atom_mask, edge_mask, n_nodes)
+            targets = labels.long()
+            loss = F.cross_entropy(outputs, targets)
+            loss.backward()
+            optimizer.step()
 
             bs = targets.size(0)
             total_loss += loss.item() * bs
@@ -314,18 +300,13 @@ if __name__ == '__main__':
             for i, batch in enumerate(pbar):
                 labels, p4s, nodes, atom_mask, edge_mask, edges = batch
                 labels = labels.to(DEVICE)
-                p4s = p4s.to(DEVICE)
-                nodes = nodes.to(DEVICE)
+                p4s = p4s.to(DEVICE).to(torch.float32)
+                nodes = nodes.to(DEVICE).to(torch.float32)
                 atom_mask = atom_mask.to(DEVICE)
                 edge_mask = edge_mask.to(DEVICE)
                 scalars = nodes.mean(dim=1)
                 n_nodes = p4s.shape[1]
-                if DEVICE.type == "cuda":
-                    p4s = p4s.to(torch.float16)
-                else:
-                    p4s = p4s.to(torch.float32)
-                with (torch.amp.autocast(device_type="cuda") if DEVICE.type=="cuda" else contextlib.nullcontext()):
-                    out = model(scalars, p4s, edges, atom_mask, edge_mask, n_nodes)
+                out = model(scalars, p4s, edges, atom_mask, edge_mask, n_nodes)
                 targets = labels.long()
                 loss = F.cross_entropy(out, targets)
                 preds = out.argmax(dim=1)
@@ -357,20 +338,15 @@ if __name__ == '__main__':
                 break
             labels, p4s, nodes, atom_mask, edge_mask, edges = batch
             labels = labels.to(DEVICE)
-            p4s = p4s.to(DEVICE)
-            nodes = nodes.to(DEVICE)
+            p4s = p4s.to(DEVICE).to(torch.float32)
+            nodes = nodes.to(DEVICE).to(torch.float32)
             atom_mask = atom_mask.to(DEVICE)
             edge_mask = edge_mask.to(DEVICE)
             scalars = nodes.mean(dim=1)
             n_nodes = p4s.shape[1]
-            if DEVICE.type == "cuda":
-                p4s = p4s.to(torch.float16)
-            else:
-                p4s = p4s.to(torch.float32)
-            with (torch.amp.autocast(device_type="cuda") if DEVICE.type=="cuda" else contextlib.nullcontext()):
-                start = time.time()
-                _ = model(scalars, p4s, edges, atom_mask, edge_mask, n_nodes)
-                end = time.time()
+            start = time.time()
+            _ = model(scalars, p4s, edges, atom_mask, edge_mask, n_nodes)
+            end = time.time()
             times.append(end - start)
         return np.mean(times) * 1000.0 if times else 0.0
 
@@ -385,8 +361,8 @@ if __name__ == '__main__':
                 for batch in loader:
                     labels, p4s, nodes, atom_mask, edge_mask, edges = batch
                     labels = labels.to(DEVICE)
-                    p4s = p4s.to(DEVICE)
-                    nodes = nodes.to(DEVICE)
+                    p4s = p4s.to(DEVICE).to(torch.float32)
+                    nodes = nodes.to(DEVICE).to(torch.float32)
                     atom_mask = atom_mask.to(DEVICE)
                     edge_mask = edge_mask.to(DEVICE)
                     scalars = nodes.mean(dim=1)
@@ -438,18 +414,13 @@ if __name__ == '__main__':
         for batch in test_loader:
             labels, p4s, nodes, atom_mask, edge_mask, edges = batch
             labels = labels.to(DEVICE)
-            p4s = p4s.to(DEVICE)
-            nodes = nodes.to(DEVICE)
+            p4s = p4s.to(DEVICE).to(torch.float32)
+            nodes = nodes.to(DEVICE).to(torch.float32)
             atom_mask = atom_mask.to(DEVICE)
             edge_mask = edge_mask.to(DEVICE)
             scalars = nodes.mean(dim=1)
             n_nodes = p4s.shape[1]
-            if DEVICE.type == "cuda":
-                p4s = p4s.to(torch.float16)
-            else:
-                p4s = p4s.to(torch.float32)
-            with (torch.amp.autocast(device_type="cuda") if DEVICE.type=="cuda" else contextlib.nullcontext()):
-                out = model(scalars, p4s, edges, atom_mask, edge_mask, n_nodes)
+            out = model(scalars, p4s, edges, atom_mask, edge_mask, n_nodes)
             preds = out.argmax(dim=1)
             all_preds.extend(preds.cpu().numpy())
             all_labels.extend(labels.cpu().numpy())
