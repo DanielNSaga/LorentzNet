@@ -1,447 +1,156 @@
+import argparse
 import os
-import glob
-import time
 import random
-import torch
-import torch.nn.functional as F
-from torch.utils.data import IterableDataset, DataLoader
 import numpy as np
-import matplotlib.pyplot as plt
-import psutil
-import seaborn as sns
-from sklearn.metrics import confusion_matrix, classification_report
-from tqdm import tqdm
-import logging
+import torch
+import torch.optim as optim
+from torch.utils.data import DataLoader, Subset
+from tqdm import tqdm  # 🔥 Progressbar
+from dataset import LorentzNetH5Dataset, collate_fn
+from model import LorentzNet
 
-logging.basicConfig(level=logging.INFO)
+# --- Adapter som flater ut 4-momenta og beholder scalar input som (B, n_scalar) ---
+class FlatteningAdapter:
+    def __call__(self, batch):
+        scalars = batch["scalars"].float()
+        x = batch["Pmu"].float()
+        B, N, _ = x.shape
+        x_flat = x.view(B * N, 4)
+        node_mask = batch["atom_mask"].float().view(B * N)
+        return scalars, x_flat, batch["edges"], node_mask, batch["edge_mask"], N
 
+# --- Dataset-wrapper som legger til jet_label basert på filtilhørighet ---
+class LabeledLorentzNetDataset(torch.utils.data.Dataset):
+    def __init__(self, base_dataset, file_to_label):
+        self.base_dataset = base_dataset
+        self.file_to_label = file_to_label
+    def __len__(self):
+        return len(self.base_dataset)
+    def __getitem__(self, idx):
+        sample = self.base_dataset[idx]
+        file_path, _ = self.base_dataset.file_indices[idx]
+        sample['jet_label'] = torch.tensor(self.file_to_label[file_path], dtype=torch.long)
+        return sample
 
-# ---------------------------
-# Streaming-datasett for LorentzNet
-# ---------------------------
-class StreamingLorentzDataset(IterableDataset):
-    """
-    Iterer over en liste med shard-filer.
-    Hver shard er en .pt-fil som inneholder en liste med (label, p4s, nodes, atom_mask).
-    Under iterasjon stokkes rekkefølgen på shardene og sample-listen i hver shard.
-    """
+# --- Funksjon for balansert splitting ---
+def create_balanced_indices(dataset, target_counts):
+    file_to_indices = {}
+    for i, (f, _) in enumerate(dataset.file_indices):
+        file_to_indices.setdefault(f, []).append(i)
+    balanced_indices = {}
+    for f, indices in file_to_indices.items():
+        random.shuffle(indices)
+        balanced_indices[f] = {
+            'train': indices[:target_counts['train']],
+            'val': indices[target_counts['train']:target_counts['train'] + target_counts['val']],
+            'test': indices[target_counts['train'] + target_counts['val']:
+                              target_counts['train'] + target_counts['val'] + target_counts['test']]
+        }
+    train_indices, val_indices, test_indices = [], [], []
+    for f in balanced_indices:
+        train_indices.extend(balanced_indices[f]['train'])
+        val_indices.extend(balanced_indices[f]['val'])
+        test_indices.extend(balanced_indices[f]['test'])
+    return train_indices, val_indices, test_indices
 
-    def __init__(self, shard_files):
-        super().__init__()
-        self.shard_files = sorted(shard_files)
-        if not self.shard_files:
-            raise RuntimeError("Ingen shard-filer funnet!")
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--data_folder', type=str, default='Data/')
+    parser.add_argument('--train_total', type=int, default=200000)
+    parser.add_argument('--val_total', type=int, default=50000)
+    parser.add_argument('--test_total', type=int, default=50000)
+    parser.add_argument('--batch_size', type=int, default=128)
+    parser.add_argument('--epochs', type=int, default=10)
+    parser.add_argument('--lr', type=float, default=1e-3)
+    parser.add_argument('--num_workers', type=int, default=4)
+    args = parser.parse_args()
 
-    def __iter__(self):
-        shards = self.shard_files.copy()
-        random.shuffle(shards)
-        for shard in shards:
-            samples = torch.load(shard, weights_only=False)
-            random.shuffle(samples)
-            for sample in samples:
-                yield sample
+    # Sett frø for reproducerbarhet
+    random.seed(42)
+    np.random.seed(42)
+    torch.manual_seed(42)
 
+    # Last inn datasettet (alle h5-filer)
+    full_dataset = LorentzNetH5Dataset(args.data_folder)
+    unique_files = sorted(list({f for (f, _) in full_dataset.file_indices}))
+    file_to_label = {f: i for i, f in enumerate(unique_files)}
+    num_classes = len(unique_files)
 
-# ---------------------------
-# Funksjon for å splitte shard-filer
-# ---------------------------
-def split_shards(shards_dir, pattern="shard_*.pt", train_frac=0.8, val_frac=0.1):
-    shard_files = sorted(glob.glob(os.path.join(shards_dir, pattern)))
-    n = len(shard_files)
-    n_train = int(train_frac * n)
-    n_val = int(val_frac * n)
-    train_shards = shard_files[:n_train]
-    val_shards = shard_files[n_train:n_train + n_val]
-    test_shards = shard_files[n_train + n_val:]
-    logging.info(
-        f"Splitter {n} shards til: {len(train_shards)} trenings-, {len(val_shards)} validerings-, {len(test_shards)} test-shards.")
-    return train_shards, val_shards, test_shards
+    # Beregn antall eksempler per fil for hvert split
+    train_per_file = args.train_total // num_classes
+    val_per_file = args.val_total // num_classes
+    test_per_file = args.test_total // num_classes
+    target_counts = {'train': train_per_file, 'val': val_per_file, 'test': test_per_file}
 
+    # Wrapp datasettet slik at hvert sample får jet_label
+    labeled_dataset = LabeledLorentzNetDataset(full_dataset, file_to_label)
+    train_indices, val_indices, test_indices = create_balanced_indices(full_dataset, target_counts)
 
-# ---------------------------
-# Collate-funksjon
-# ---------------------------
-def collate_fn(data):
-    # data er en liste med tuples: (label, p4s, nodes, atom_mask)
-    labels, p4s, nodes, atom_masks = zip(*data)
-    labels = torch.stack(labels)  # (B,)
-    p4s = torch.stack(p4s)  # (B, n_nodes, 4)
-    nodes = torch.stack(nodes)  # (B, n_nodes, 4)
-    atom_masks = torch.stack(atom_masks)  # (B, n_nodes)
+    from torch.utils.data import Subset
+    train_dataset = Subset(labeled_dataset, train_indices)
+    val_dataset = Subset(labeled_dataset, val_indices)
+    test_dataset = Subset(labeled_dataset, test_indices)
 
-    batch_size, n_nodes, _ = p4s.shape
-    # Bygg edge_mask: True for ekte partikler (uten padding)
-    edge_mask = atom_masks.unsqueeze(1) * atom_masks.unsqueeze(2)
-    # Fjern diagonal (selv-koblinger)
-    diag_mask = ~torch.eye(n_nodes, dtype=torch.bool).unsqueeze(0)
-    edge_mask = edge_mask * diag_mask
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True,
+                              collate_fn=collate_fn, num_workers=args.num_workers, pin_memory=True)
+    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False,
+                            collate_fn=collate_fn, num_workers=args.num_workers, pin_memory=True)
+    test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False,
+                             collate_fn=collate_fn, num_workers=args.num_workers, pin_memory=True)
 
-    # Bygg kantindeks (edges) fra edge_mask
-    rows, cols = [], []
-    from scipy.sparse import coo_matrix
-    for batch_idx in range(batch_size):
-        offset = batch_idx * n_nodes
-        x = coo_matrix(edge_mask[batch_idx].numpy())
-        rows.append(offset + x.row)
-        cols.append(offset + x.col)
-    rows = np.concatenate(rows)
-    cols = np.concatenate(cols)
-    edges = [torch.LongTensor(rows), torch.LongTensor(cols)]
+    # Instansier modellen
+    model = LorentzNet(n_scalar=1, n_hidden=64, n_class=num_classes, n_layers=6, c_weight=1e-3, dropout=0.1)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = model.to(device)
+    adapter = FlatteningAdapter()
 
-    return labels, p4s, nodes, atom_masks, edge_mask, edges
+    optimizer = optim.Adam(model.parameters(), lr=args.lr)
+    criterion = torch.nn.CrossEntropyLoss()
 
-
-# ---------------------------
-# Modell-definisjoner
-# ---------------------------
-import torch.nn as nn
-
-
-def normsq4(p):
-    """Minkowski-norm kvadrat: ||p||² = p₀² - p₁² - p₂² - p₃²"""
-    psq = torch.pow(p, 2)
-    return 2 * psq[..., 0] - psq.sum(dim=-1)
-
-
-def dotsq4(p, q):
-    """Minkowski indre produkt: <p,q> = p₀q₀ - p₁q₁ - p₂q₂ - p₃q₃"""
-    psq = p * q
-    return 2 * psq[..., 0] - psq.sum(dim=-1)
-
-
-def psi(p):
-    """Feature-transformasjon for Minkowski-verdier: ψ(p) = sign(p) * log(|p| + 1)"""
-    return torch.sign(p) * torch.log(torch.abs(p) + 1)
-
-
-class LGEB(nn.Module):
-    """Lorentz Group Equivariant Block (LGEB)"""
-
-    def __init__(self, n_input, n_output, n_hidden, n_node_attr=0,
-                 dropout=0., c_weight=1.0, last_layer=False):
-        super(LGEB, self).__init__()
-        self.c_weight = c_weight
-        n_edge_attr = 2  # Minkowski-norm & indre produkt
-
-        self.phi_e = nn.Sequential(
-            nn.Linear(n_input * 2 + n_edge_attr, n_hidden, bias=False),
-            nn.BatchNorm1d(n_hidden),
-            nn.ReLU(),
-            nn.Linear(n_hidden, n_hidden),
-            nn.ReLU()
-        )
-        self.phi_h = nn.Sequential(
-            nn.Linear(n_hidden + n_input + n_node_attr, n_hidden),
-            nn.BatchNorm1d(n_hidden),
-            nn.ReLU(),
-            nn.Linear(n_hidden, n_output)
-        )
-        layer = nn.Linear(n_hidden, 1, bias=False)
-        torch.nn.init.xavier_uniform_(layer.weight, gain=0.001)
-        self.phi_x = nn.Sequential(
-            nn.Linear(n_hidden, n_hidden),
-            nn.ReLU(),
-            layer
-        )
-        self.phi_m = nn.Sequential(
-            nn.Linear(n_hidden, 1),
-            nn.Sigmoid()
-        )
-        self.last_layer = last_layer
-        if last_layer:
-            del self.phi_x
-
-    def m_model(self, hi, hj, norms, dots):
-        out = torch.cat([hi, hj, norms, dots], dim=1)
-        out = self.phi_e(out)
-        w = self.phi_m(out)
-        return out * w
-
-    def h_model(self, h, edges, m, node_attr):
-        i, j = edges
-        agg = unsorted_segment_sum(m, i, num_segments=h.size(0))
-        agg = torch.cat([h, agg, node_attr], dim=1)
-        return h + self.phi_h(agg)
-
-    def x_model(self, x, edges, x_diff, m):
-        i, j = edges
-        trans = x_diff * self.phi_x(m)
-        trans = torch.clamp(trans, min=-100, max=100)
-        agg = unsorted_segment_mean(trans, i, num_segments=x.size(0))
-        return x + agg * self.c_weight
-
-    def minkowski_feats(self, edges, x):
-        i, j = edges
-        x_diff = x[i] - x[j]
-        norms = normsq4(x_diff).unsqueeze(1)
-        dots = dotsq4(x[i], x[j]).unsqueeze(1)
-        norms, dots = psi(norms), psi(dots)
-        return norms, dots, x_diff
-
-    def forward(self, h, x, edges, node_attr=None):
-        i, j = edges
-        norms, dots, x_diff = self.minkowski_feats(edges, x)
-        m = self.m_model(h[i], h[j], norms, dots)
-        if not self.last_layer:
-            x = self.x_model(x, edges, x_diff, m)
-        h = self.h_model(h, edges, m, node_attr)
-        return h, x, m
-
-
-class LorentzNet(nn.Module):
-    def __init__(self, n_scalar, n_hidden, n_class, n_layers=6, c_weight=1e-3, dropout=0.):
-        super(LorentzNet, self).__init__()
-        self.n_hidden = n_hidden
-        self.n_layers = n_layers
-        # Forventer at input er 4-dimensjonal (fire-vektor)
-        self.embedding = nn.Linear(4, n_hidden)
-
-        self.LGEBs = nn.ModuleList([
-            LGEB(self.n_hidden, self.n_hidden, self.n_hidden,
-                 n_node_attr=4, dropout=dropout, c_weight=c_weight, last_layer=(i == n_layers - 1))
-            for i in range(n_layers)
-        ])
-
-        self.graph_dec = nn.Sequential(
-            nn.Linear(self.n_hidden, self.n_hidden),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(self.n_hidden, n_class)
-        )
-
-    def forward(self, p4, x, edges, node_mask, edge_mask, n_nodes):
-        # p4 har formen (B, n_nodes, 4)
-        B = p4.shape[0]
-        # Flate ut til (B*n_nodes, 4)
-        p4_flat = p4.view(B * n_nodes, 4)
-        # Bruk p4_flat for embedding og som initial x
-        h = self.embedding(p4_flat)
-        x = p4_flat.clone()
-        # Bruk også p4_flat som node_attr i LGEB-blokkene
-        for i in range(self.n_layers):
-            h, x, _ = self.LGEBs[i](h, x, edges, node_attr=p4_flat)
-        # Reshape h til (B, n_nodes, hidden)
-        h = h.view(B, n_nodes, self.n_hidden)
-        # Tilpass node_mask (B, n_nodes) til (B, n_nodes, 1) før maskering
-        node_mask = node_mask.view(B, n_nodes, 1)
-        h = h * node_mask
-        # Aggreger nodene (for eksempel ved gjennomsnitt)
-        h = torch.mean(h, dim=1)
-        return self.graph_dec(h).squeeze(1)
-
-
-
-# ---------------------------
-# Hjelpefunksjoner for segment-sum og mean
-# ---------------------------
-def unsorted_segment_sum(data, segment_ids, num_segments):
-    result = data.new_zeros((num_segments, data.size(1)))
-    result.index_add_(0, segment_ids, data)
-    return result
-
-
-def unsorted_segment_mean(data, segment_ids, num_segments):
-    result = data.new_zeros((num_segments, data.size(1)))
-    count = data.new_zeros((num_segments, data.size(1)))
-    result.index_add_(0, segment_ids, data)
-    count.index_add_(0, segment_ids, torch.ones_like(data))
-    return result / count.clamp(min=1)
-
-
-# ---------------------------
-# Hyperparametere og Args
-# ---------------------------
-class Args:
-    def __init__(self):
-        self.n_scalar = 2  # f.eks. invariant masse og ladning
-        self.n_hidden = 64
-        self.n_class = 10  # Binær klassifisering
-        self.n_layers = 6
-        self.c_weight = 1e-3
-        self.dropout = 0.0
-
-        self.epochs = 10
-        self.batch_size = 128
-        self.learning_rate = 1e-3
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
-
-        self.shards_dir = "./processed_dataset/shards"
-
-
-args = Args()
-
-# ---------------------------
-# Hovedtreningskode (i main-blokk)
-# ---------------------------
-if __name__ == '__main__':
-    import torch.multiprocessing as mp
-
-    mp.set_start_method('fork', force=True)
-
-    DEVICE = torch.device(args.device)
-    if DEVICE.type == "cuda":
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.benchmark = True
-
-    # Splitte shard-filene i separate sett for trening, validering og testing:
-    train_shards, val_shards, test_shards = split_shards(args.shards_dir)
-
-    train_dataset = StreamingLorentzDataset(train_shards)
-    val_dataset = StreamingLorentzDataset(val_shards)
-    test_dataset = StreamingLorentzDataset(test_shards)
-
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, num_workers=4, collate_fn=collate_fn,
-                              pin_memory=True)
-    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, num_workers=4, collate_fn=collate_fn,
-                            pin_memory=True)
-    test_loader = DataLoader(test_dataset, batch_size=args.batch_size, num_workers=4, collate_fn=collate_fn,
-                             pin_memory=True)
-
-    model = LorentzNet(n_scalar=args.n_scalar, n_hidden=args.n_hidden, n_class=args.n_class,
-                       n_layers=args.n_layers, c_weight=args.c_weight, dropout=args.dropout).to(DEVICE)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate)
-
-    TRAIN_BATCHES_TOTAL = 12500
-    VAL_BATCHES_TOTAL = 1562
-    TEST_BATCHES_TOTAL = 1562
-
-
-    def train_epoch(model, optimizer, loader, epoch):
+    # Treningsløkke med progressbar
+    for epoch in range(args.epochs):
         model.train()
-        total_loss, total_correct, total_samples = 0.0, 0, 0
-        pbar = tqdm(loader, desc=f"Epoch {epoch}", leave=True, total=TRAIN_BATCHES_TOTAL)
-        for i, batch in enumerate(pbar):
-            labels, p4s, nodes, atom_mask, edge_mask, edges = batch
-            labels = labels.to(DEVICE)
-            p4s = p4s.to(DEVICE).to(torch.float32)
-            nodes = nodes.to(DEVICE).to(torch.float32)
-            atom_mask = atom_mask.to(DEVICE)
-            edge_mask = edge_mask.to(DEVICE)
-            n_nodes = p4s.shape[1]
+        total_loss = 0
+        train_pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs} [Training]")  # 🚀 Progressbar
+        for batch in train_pbar:
             optimizer.zero_grad()
-            # Bruk p4s direkte som input til modellen
-            outputs = model(p4s, p4s, edges, atom_mask, edge_mask, n_nodes)
-            targets = labels.long()
-            loss = F.cross_entropy(outputs, targets)
+            scalars, x_flat, edges, node_mask, edge_mask, n_nodes = adapter(batch)
+            scalars, x_flat, node_mask, edge_mask = scalars.to(device), x_flat.to(device), node_mask.to(device), edge_mask.to(device)
+            edges = [e.to(device) for e in edges]
+            outputs = model(scalars, x_flat, edges, node_mask, edge_mask, n_nodes)
+            targets = batch["jet_label"].to(device)
+            loss = criterion(outputs, targets)
             loss.backward()
             optimizer.step()
+            total_loss += loss.item()
+            train_pbar.set_postfix(loss=loss.item())  # 🔄 Oppdaterer progressbaren
 
-            bs = targets.size(0)
-            total_loss += loss.item() * bs
-            total_correct += (outputs.argmax(dim=1) == targets).sum().item()
-            total_samples += bs
-            cur_loss = total_loss / total_samples
-            cur_acc = total_correct / total_samples
-            pbar.set_postfix(loss=f"{cur_loss:.4f}", acc=f"{cur_acc:.4f}")
-            if i + 1 >= TRAIN_BATCHES_TOTAL:
-                break
-        return total_loss / total_samples, total_correct / total_samples
+        avg_loss = total_loss / len(train_loader)
+        print(f"Epoch {epoch+1}/{args.epochs} - Train Loss: {avg_loss:.4f}")
 
-
-    def validate_epoch(model, loader, epoch_str="Val"):
+        # Valideringsfase med progressbar
         model.eval()
-        total_loss, total_correct, total_samples = 0.0, 0, 0
-        pbar = tqdm(loader, desc=epoch_str, leave=True, total=VAL_BATCHES_TOTAL)
+        total_val_loss = 0
+        correct = 0
+        total = 0
+        val_pbar = tqdm(val_loader, desc=f"Epoch {epoch+1}/{args.epochs} [Validation]")  # 🚀 Progressbar
         with torch.no_grad():
-            for i, batch in enumerate(pbar):
-                labels, p4s, nodes, atom_mask, edge_mask, edges = batch
-                labels = labels.to(DEVICE)
-                p4s = p4s.to(DEVICE).to(torch.float32)
-                nodes = nodes.to(DEVICE).to(torch.float32)
-                atom_mask = atom_mask.to(DEVICE)
-                edge_mask = edge_mask.to(DEVICE)
-                n_nodes = p4s.shape[1]
-                out = model(p4s, p4s, edges, atom_mask, edge_mask, n_nodes)
-                targets = labels.long()
-                loss = F.cross_entropy(out, targets)
-                preds = out.argmax(dim=1)
-                bs = targets.size(0)
-                total_loss += loss.item() * bs
-                total_correct += (preds == targets).sum().item()
-                total_samples += bs
-                cur_loss = total_loss / total_samples
-                cur_acc = total_correct / total_samples
-                pbar.set_postfix(loss=f"{cur_loss:.4f}", acc=f"{cur_acc:.4f}")
-                if i + 1 >= VAL_BATCHES_TOTAL:
-                    break
-        return total_loss / total_samples, total_correct / total_samples
+            for batch in val_pbar:
+                scalars, x_flat, edges, node_mask, edge_mask, n_nodes = adapter(batch)
+                scalars, x_flat, node_mask, edge_mask = scalars.to(device), x_flat.to(device), node_mask.to(device), edge_mask.to(device)
+                edges = [e.to(device) for e in edges]
+                outputs = model(scalars, x_flat, edges, node_mask, edge_mask, n_nodes)
+                targets = batch["jet_label"].to(device)
+                loss = criterion(outputs, targets)
+                total_val_loss += loss.item()
+                preds = outputs.argmax(dim=1)
+                correct += (preds == targets).sum().item()
+                total += targets.size(0)
+                val_pbar.set_postfix(loss=loss.item())  # 🔄 Oppdaterer progressbaren
 
+        avg_val_loss = total_val_loss / len(val_loader)
+        val_acc = correct / total * 100
+        print(f"Epoch {epoch+1}/{args.epochs} - Val Loss: {avg_val_loss:.4f}, Val Acc: {val_acc:.2f}%")
 
-    @torch.no_grad()
-    def measure_inference_latency(model, loader, num_samples=1000):
-        model.eval()
-        times = []
-        for count, batch in enumerate(loader):
-            if count >= num_samples:
-                break
-            labels, p4s, nodes, atom_mask, edge_mask, edges = batch
-            labels = labels.to(DEVICE)
-            p4s = p4s.to(DEVICE).to(torch.float32)
-            nodes = nodes.to(DEVICE).to(torch.float32)
-            atom_mask = atom_mask.to(DEVICE)
-            edge_mask = edge_mask.to(DEVICE)
-            n_nodes = p4s.shape[1]
-            start = time.time()
-            _ = model(p4s, p4s, edges, atom_mask, edge_mask, n_nodes)
-            end = time.time()
-            times.append(end - start)
-        return np.mean(times) * 1000.0 if times else 0.0
-
-
-    best_val_loss = float('inf')
-    best_epoch = -1
-
-    for epoch in range(args.epochs):
-        train_loss, train_acc = train_epoch(model, optimizer, train_loader, epoch)
-        val_loss, val_acc = validate_epoch(model, val_loader, epoch_str=f"Val epoch={epoch}")
-        print(
-            f"Epoch {epoch}: Train Loss={train_loss:.4f} Acc={train_acc:.4f} | Val Loss={val_loss:.4f} Acc={val_acc:.4f}")
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            best_epoch = epoch
-            torch.save({"model_state_dict": model.state_dict()}, "best_lorentznet.pt")
-            print(f"🔹 Lagret checkpoint ved epoch {epoch}")
-
-    print(f"📥 Laster beste checkpoint fra epoch {best_epoch}")
-    model.load_state_dict(torch.load("best_lorentznet.pt")["model_state_dict"])
-    model.to(DEVICE)
-
-    print("📊 Evaluering på test-sett:")
-    test_loss, test_acc = validate_epoch(model, test_loader, epoch_str="Test")
-    print(f"Test => Loss={test_loss:.4f}, Acc={test_acc:.4f}")
-
-    latency = measure_inference_latency(model, test_loader)
-    print(f"🕒 Inference-latency per batch ~ {latency:.3f} ms")
-
-    memory_usage = psutil.virtual_memory().used / 1e9
-    print(f"💾 Memory usage ~ {memory_usage:.2f} GB")
-
-    # Confusion Matrix
-    all_preds, all_labels = [], []
-    with torch.no_grad():
-        for batch in test_loader:
-            labels, p4s, nodes, atom_mask, edge_mask, edges = batch
-            labels = labels.to(DEVICE)
-            p4s = p4s.to(DEVICE).to(torch.float32)
-            nodes = nodes.to(DEVICE).to(torch.float32)
-            atom_mask = atom_mask.to(DEVICE)
-            edge_mask = edge_mask.to(DEVICE)
-            n_nodes = p4s.shape[1]
-            out = model(p4s, p4s, edges, atom_mask, edge_mask, n_nodes)
-            preds = out.argmax(dim=1)
-            all_preds.extend(preds.cpu().numpy())
-            all_labels.extend(labels.cpu().numpy())
-
-    cm = confusion_matrix(all_labels, all_preds)
-    plt.figure(figsize=(6, 5))
-    sns.heatmap(cm, annot=True, fmt="d", cmap="Blues")
-    plt.xlabel("Predicted")
-    plt.ylabel("True")
-    plt.title("Confusion Matrix")
-    plt.savefig("confusion_matrix_lorentznet.png")
-    plt.show()
-
-    print("📊 Klassifikasjonsrapport:")
-    print(classification_report(all_labels, all_preds, digits=4))
-
-    print("✅ Fullført trening!")
+if __name__ == '__main__':
+    main()
